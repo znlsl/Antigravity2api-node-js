@@ -23,12 +23,12 @@ function buildAxiosProxyConfig() {
   }
 }
 
-export async function fetchActiveProjects(accessToken, baseUrl) {
+export async function fetchActiveProjects(accessToken) {
   if (!accessToken) {
     throw new Error('缺少 access_token，无法查询项目列表');
   }
 
-  const resourceManagerBaseUrl = (baseUrl || getResourceManagerBaseUrl()).replace(/\/+$/, '');
+  const resourceManagerBaseUrl = getResourceManagerBaseUrl();
   const url = `${resourceManagerBaseUrl}/v1/projects`;
 
   const axiosConfig = {
@@ -75,10 +75,37 @@ export function selectDefaultProjectId(projects) {
   return projects[0].projectId || null;
 }
 
+export async function fetchUserEmail(accessToken) {
+  if (!accessToken) {
+    throw new Error('缺少 access_token，无法获取用户邮箱');
+  }
+
+  const axiosConfig = {
+    method: 'GET',
+    url: 'https://www.googleapis.com/oauth2/v2/userinfo',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'User-Agent': 'antigravity-oauth/1.0'
+    },
+    timeout: 10000,
+    proxy: buildAxiosProxyConfig()
+  };
+
+  try {
+    const res = await axios(axiosConfig);
+    const data = res.data || {};
+    return data.email || null;
+  } catch (error) {
+    logger.warn(`获取用户邮箱失败: ${error?.message || error}`);
+    return null;
+  }
+}
+
 export async function resolveProjectIdFromAccessToken(accessToken) {
   try {
-    const projects = await fetchActiveProjects(accessToken, process.env.RESOURCE_MANAGER_API_URL);
+    const projects = await fetchActiveProjects(accessToken);
     const projectId = selectDefaultProjectId(projects);
+    logger.info(`获取到 ${projects.length} 个项目，选择的项目ID: ${projectId}`);
     return { projectId, projects, error: null };
   } catch (error) {
     logger.warn(

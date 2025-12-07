@@ -10,6 +10,7 @@ import axios from 'axios';
 import config from '../src/config/config.js';
 import { generateProjectId } from '../src/utils/idGenerator.js';
 import { buildAuthUrl, exchangeCodeForToken } from '../src/auth/oauth_client.js';
+import { fetchUserEmail } from '../src/auth/project_id_resolver.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -123,6 +124,19 @@ server.listen(0, () => {
         expires_in: tokenData.expires_in,
         timestamp: Date.now()
       };
+
+      // 获取用户邮箱
+      if (tokenData.access_token) {
+        try {
+          const userEmail = await fetchUserEmail(tokenData.access_token);
+          if (userEmail) {
+            account.email = userEmail;
+            log.info(`成功获取用户邮箱: ${userEmail}`);
+          }
+        } catch (err) {
+          log.warn(`获取用户邮箱失败: ${err?.message || err}`);
+        }
+      }
 
       if (config.skipProjectIdFetch) {
         account.projectId = generateProjectId();

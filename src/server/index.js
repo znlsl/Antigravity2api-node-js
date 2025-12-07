@@ -18,7 +18,7 @@ import logger from '../utils/logger.js';
 import config from '../config/config.js';
 import tokenManager from '../auth/token_manager.js';
 import { buildAuthUrl, exchangeCodeForToken } from '../auth/oauth_client.js';
-import { resolveProjectIdFromAccessToken } from '../auth/project_id_resolver.js';
+import { resolveProjectIdFromAccessToken, fetchUserEmail } from '../auth/project_id_resolver.js';
 import {
   appendLog,
   getLogDetail,
@@ -759,28 +759,42 @@ app.post('/auth/oauth/parse-url', requirePanelAuthApi, async (req, res) => {
     return res.status(400).json({ error: 'state 校验失败，请确认粘贴的是最新的授权回调地址' });
   }
 
-  // redirectUri 必须与构造授权链接时保持一致，这里直接使用粘贴 URL 的 origin + pathname
-  const redirectUri = `${parsed.origin}${parsed.pathname}`;
+  // 直接使用构造OAuth链接时相同的 redirectUri，避免不匹配问题
+  const redirectUri = `http://localhost:${config.server.port}/oauth-callback`;
 
     try {
       const tokenData = await exchangeCodeForToken(code, redirectUri);
   
       let projectId = null;
+      let userEmail = null;
       let projectResolveError = null;
       if (tokenData?.access_token) {
         try {
-          // 與 TokenManager 保持一致：通過 loadCodeAssist 鑾峰彇椤圭洰 ID
-          const loadedProjectId = await tokenManager.fetchProjectId({
-            access_token: tokenData.access_token
-          });
-          if (loadedProjectId !== undefined && loadedProjectId !== null) {
-            projectId = loadedProjectId;
+          // 获取用户邮箱
+          userEmail = await fetchUserEmail(tokenData.access_token);
+          logger.info(`成功获取用户邮箱: ${userEmail}`);
+
+          // 使用更可靠的Resource Manager方法获取项目ID
+          const result = await resolveProjectIdFromAccessToken(tokenData.access_token);
+          if (result.projectId) {
+            projectId = result.projectId;
+            logger.info(`通过Resource Manager获取到项目ID: ${projectId}`);
+          } else {
+            // 备用方案：使用原有的loadCodeAssist方法
+            const loadedProjectId = await tokenManager.fetchProjectId({
+              access_token: tokenData.access_token
+            });
+            if (loadedProjectId !== undefined && loadedProjectId !== null) {
+              projectId = loadedProjectId;
+              logger.info(`备用方案获取到项目ID: ${projectId}`);
+            }
           }
         } catch (err) {
           projectResolveError = err;
         }
       }
 
+      // 如果无法获取项目ID，尝试使用备用方案
       if (!projectId && !allowRandomProjectId) {
         const message =
           projectResolveError?.message ||
@@ -791,16 +805,20 @@ app.post('/auth/oauth/parse-url', requirePanelAuthApi, async (req, res) => {
       if (!projectId && allowRandomProjectId) {
         projectId = generateProjectId();
       }
-  
+
       const account = {
         access_token: tokenData.access_token,
         refresh_token: tokenData.refresh_token,
         expires_in: tokenData.expires_in,
         timestamp: Date.now()
       };
-  
+
       if (projectId) {
         account.projectId = projectId;
+      }
+
+      if (userEmail) {
+        account.email = userEmail;
       }
 
     let accounts = [];
