@@ -113,7 +113,7 @@ function loadConfigFromEnv() {
     security: {
       maxRequestSize: flat.MAX_REQUEST_SIZE || '50mb',
       // 安全：API_KEY 永远只从环境变量（Docker 设置）读取
-      apiKey: flat.API_KEY || null
+      apiKey: flat.API_KEY || flat['API-KEY'] || process.env['API-KEY'] || null
     },
     credentials: {
       maxUsagePerHour:

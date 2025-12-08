@@ -15,6 +15,14 @@ import {
 } from '../api/client.js';
 import { generateRequestBody } from '../utils/utils.js';
 import { generateProjectId } from '../utils/idGenerator.js';
+import {
+  mapClaudeToOpenAI,
+  mapClaudeToolsToOpenAITools,
+  countClaudeTokens,
+  ClaudeSseEmitter,
+  buildClaudeContentBlocks,
+  estimateTokensFromText
+} from '../utils/claudeAdapter.js';
 import logger from '../utils/logger.js';
 import {
   loadDataConfig,
@@ -483,14 +491,26 @@ const isProtectedApiPath = pathname => {
   return /^\/(?:[\w-]+\/)?v1\//.test(normalized) || normalized.startsWith('/gemini/');
 };
 
+function extractApiKeyFromHeaders(req) {
+  const headers = req.headers || {};
+  const authHeader = headers.authorization;
+  if (authHeader?.startsWith('Bearer ')) return authHeader.slice(7);
+  if (authHeader) return authHeader;
+  // 兼容各种大小写/横线/下划线写法
+  const candidates = [
+    headers['x-api-key'],
+    headers['api-key'],
+    headers['x-api_key'],
+    headers['api_key']
+  ];
+  return candidates.find(v => v) || null;
+}
+
 app.use((req, res, next) => {
   if (isProtectedApiPath(req.path)) {
     const apiKey = config.security?.apiKey;
     if (apiKey) {
-      const authHeader = req.headers.authorization;
-      const providedKey = authHeader?.startsWith('Bearer ')
-        ? authHeader.slice(7)
-        : authHeader;
+      const providedKey = extractApiKeyFromHeaders(req);
       if (providedKey !== apiKey) {
         logger.warn(`API Key验证失败: ${req.method} ${req.path}`);
         return res.status(401).json({ error: 'Invalid API Key' });
@@ -1582,6 +1602,160 @@ app.post(
     { tokenMissingError: '指定的凭证不存在或已停用，请检查凭证名。', tokenMissingStatus: 404 }
   )
 );
+
+app.post('/v1/messages/count_tokens', (req, res) => {
+  const startedAt = Date.now();
+  const requestSnapshot = createRequestSnapshot(req);
+  let responseBodyForLog = null;
+
+  const writeLog = ({ success, status, message }) =>
+    appendLog({
+      timestamp: new Date().toISOString(),
+      model: req.body?.model || 'unknown',
+      projectId: null,
+      success,
+      status,
+      message,
+      durationMs: Date.now() - startedAt,
+      path: req.originalUrl,
+      method: req.method,
+      detail: {
+        request: requestSnapshot,
+        response: {
+          status,
+          headers: res.getHeaders ? res.getHeaders() : undefined,
+          body: responseBodyForLog
+        }
+      }
+    });
+
+  try {
+    const result = countClaudeTokens(req.body || {});
+    responseBodyForLog = result;
+    res.json(result);
+    writeLog({ success: true, status: res.statusCode || 200 });
+  } catch (error) {
+    const status = 400;
+    const message = error?.message || '璁＄畻澶辫触';
+    res.status(status).json({ error: message });
+    writeLog({ success: false, status, message });
+  }
+});
+
+app.post('/v1/messages', async (req, res) => {
+  const startedAt = Date.now();
+  const requestSnapshot = createRequestSnapshot(req);
+  let responseBodyForLog = null;
+  let token = null;
+  let openaiReq = null;
+  let requestBody = null;
+
+  const writeLog = ({ success, status, message }) =>
+    appendLog({
+      timestamp: new Date().toISOString(),
+      model: openaiReq?.model || req.body?.model || 'unknown',
+      projectId: token?.projectId || null,
+      success,
+      status,
+      message,
+      durationMs: Date.now() - startedAt,
+      path: req.originalUrl,
+      method: req.method,
+      detail: {
+        request: requestSnapshot,
+        response: {
+          status,
+          headers: res.getHeaders ? res.getHeaders() : undefined,
+          body: responseBodyForLog
+        }
+      }
+    });
+
+  try {
+    openaiReq = mapClaudeToOpenAI(req.body || {});
+    const tokenStats = (() => {
+      try {
+        return countClaudeTokens(req.body || {});
+      } catch {
+        return { input_tokens: 0 };
+      }
+    })();
+
+    token = await tokenManager.getToken();
+    if (!token) {
+      const message = '娌℃湁鍙敤鐨?token锛岃鍏堥€氳繃 OAuth 闈㈡澘鎴?npm run login 鑾峰彇銆?';
+      res.status(503).json({ error: message });
+      writeLog({ success: false, status: 503, message });
+      return;
+    }
+
+    const openaiTools = mapClaudeToolsToOpenAITools(req.body?.tools || []);
+    requestBody = generateRequestBody(
+      openaiReq.messages,
+      openaiReq.model,
+      openaiReq,
+      openaiTools,
+      token
+    );
+
+    const requestId = requestBody.requestId;
+
+    if (openaiReq.stream) {
+      setStreamHeaders(res);
+      const emitter = new ClaudeSseEmitter(res, requestId, {
+        model: openaiReq.model,
+        inputTokens: tokenStats?.input_tokens || 0
+      });
+      emitter.start();
+
+      const { usage } = await generateAssistantResponse(requestBody, token, async data => {
+        if (data.type === 'thinking') {
+          emitter.sendThinking(data.content);
+        } else if (data.type === 'text') {
+          emitter.sendText(data.content);
+        } else if (data.type === 'tool_calls') {
+          await emitter.sendToolCalls(data.tool_calls);
+        }
+      });
+
+      responseBodyForLog = { stream: true, usage };
+      emitter.finish(usage);
+      writeLog({ success: true, status: res.statusCode || 200 });
+    } else {
+      const result = await generateAssistantResponseNoStream(requestBody, token);
+      const contentBlocks = buildClaudeContentBlocks(result.content, result.toolCalls);
+      const outputTokens =
+        result.usage?.completion_tokens ??
+        result.usage?.output_tokens ??
+        (result.content ? estimateTokensFromText(result.content) : 0);
+
+      const payload = {
+        id: `msg_${requestId}`,
+        type: 'message',
+        role: 'assistant',
+        model: openaiReq.model,
+        content: contentBlocks,
+        stop_reason: result.toolCalls?.length ? 'tool_use' : 'end_turn',
+        stop_sequence: null,
+        usage: {
+          input_tokens: tokenStats?.input_tokens || 0,
+          output_tokens: outputTokens || 0
+        }
+      };
+
+      responseBodyForLog = payload;
+      res.json(payload);
+      writeLog({ success: true, status: res.statusCode || 200 });
+    }
+  } catch (error) {
+    logger.error('/v1/messages 璇锋眰澶辫触:', error?.message || error);
+    const status = error?.statusCode || 500;
+    if (!res.headersSent) {
+      res.status(status).json({ error: error?.message || '鏈嶅姟鍣ㄥけ璐?' });
+    }
+    writeLog({ success: false, status, message: error?.message });
+  }
+});
 
 app.post(/^\/gemini\/v1beta\/models\/([^/]+):streamGenerateContent$/, async (req, res) => {
   const model = req.params[0];

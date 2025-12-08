@@ -170,22 +170,31 @@ export function readLogs() {
 }
 
 export function appendLog(entry) {
-  if (!entry || !shouldLogEntry(entry)) {
+  if (!entry) return null;
+
+  const trackUsage = entry.trackUsage !== false;
+  const allowLog = shouldLogEntry(entry);
+
+  // 完全跳过：既不记录日志也不做用量统计
+  if (!allowLog && !trackUsage) {
     return null;
   }
 
-  const { detail, ...rest } = entry || {};
+  const { detail, trackUsage: _ignored, ...rest } = entry || {};
   const timestamp = rest?.timestamp || new Date().toISOString();
   const id = rest?.id || randomUUID();
   const normalizedEntry = { ...rest, id, timestamp };
   const now = parseTimestamp(timestamp) || Date.now();
+  const usageOnly = trackUsage && !allowLog;
 
   ensureDir();
   const baseLogs = pruneLogs(readLogs(), now);
-  const mergedEntry = {
-    ...normalizedEntry,
-    ...(detail ? writeDetail(id, detail) : {})
-  };
+  const mergedEntry = usageOnly
+    ? { ...normalizedEntry, usageOnly: true }
+    : {
+        ...normalizedEntry,
+        ...(detail ? writeDetail(id, detail) : {})
+      };
 
   const updated = [...baseLogs, mergedEntry];
   let sliced = updated;
@@ -199,7 +208,7 @@ export function appendLog(entry) {
 }
 
 export function getRecentLogs(limit = 200) {
-  const logs = readLogs();
+  const logs = readLogs().filter(log => !log.usageOnly);
   const list = !limit || Number.isNaN(limit) ? logs : logs.slice(-limit);
   return list
     .reverse()
